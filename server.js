@@ -5,11 +5,20 @@ import nodemailer from 'nodemailer';
 import sqlite3 from 'sqlite3';
 import { open } from 'sqlite';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 
 dotenv.config();
 const app = express();
 app.use(express.json());
 
+// Ensure data directory exists
+const defaultLocal = path.resolve('./data/bookings.sqlite');
+const defaultRender = '/data/bookings.sqlite';
+const DB_FILE = process.env.DB_FILE || (process.env.RENDER ? defaultRender : defaultLocal);
+fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
+
+// CORS
 const allow = (process.env.CORS_ORIGIN || '').split(',').map(s=>s.trim()).filter(Boolean);
 app.use(cors({
   origin: (origin, cb) => {
@@ -18,7 +27,8 @@ app.use(cors({
   }
 }));
 
-const db = await open({ filename: './data/bookings.sqlite', driver: sqlite3.Database });
+// SQLite
+const db = await open({ filename: DB_FILE, driver: sqlite3.Database });
 await db.exec(`
 CREATE TABLE IF NOT EXISTS bookings(
  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,6 +56,7 @@ const OPEN = 9;
 const CLOSE = 17;
 const HOURS = Array.from({length: CLOSE-OPEN}, (_,i)=>String(OPEN+i).padStart(2,'0')+':00');
 
+// Mailer
 function buildMailer(){
   if (process.env.SMTP_HOST) {
     return nodemailer.createTransport({
@@ -68,17 +79,20 @@ const mailer = buildMailer();
 function nextHour(hhmm){ const h = Number(hhmm.slice(0,2)); return String(h+1).padStart(2,'0')+':00'; }
 const PUBLIC_BASE = process.env.PUBLIC_BASE || '';
 
+// Health
 app.get('/health', (req,res)=> res.json({ ok:true }));
 
+// Availability
 app.get('/availability', async (req,res)=>{
   const { date } = req.query;
-  if (!date || !/^\\d{4}-\\d{2}-\\d{2}$/.test(date)) return res.status(400).json({ error:'Invalid or missing date (YYYY-MM-DD)' });
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error:'Invalid or missing date (YYYY-MM-DD)' });
   const taken = await db.all(`SELECT start_time FROM bookings WHERE date=? AND status IN ('pending','approved')`, date);
   const set = new Set(taken.map(r=>r.start_time));
   const free = HOURS.filter(h=>!set.has(h)).map(start => ({ start, end: nextHour(start) }));
   res.json({ date, slots: free });
 });
 
+// Book
 app.post('/book', async (req,res)=>{
   try{
     const {
@@ -90,7 +104,7 @@ app.post('/book', async (req,res)=>{
     if (role==='student' && !studentNumber) throw new Error('studentNumber');
     if (role==='external' && !company) throw new Error('company');
     if (!name || !phone || !email) throw new Error('contact');
-    if (!date || !/^\\d{4}-\\d{2}-\\d{2}$/.test(date)) throw new Error('date');
+    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('date');
     if (!Array.isArray(startTimes) || startTimes.length===0) throw new Error('time');
     if (!acceptedTerms) throw new Error('terms');
 
@@ -113,10 +127,11 @@ app.post('/book', async (req,res)=>{
       lastID = r.lastID;
     }
 
+    // Email
     const to = process.env.NOTIFY_TO;
     if (mailer && to){
-      const approveUrl = `${PUBLIC_BASE || 'https://'+(req.headers.host||'')}/approve/${token}`;
-      const rejectUrl  = `${PUBLIC_BASE || 'https://'+(req.headers.host||'')}/reject/${token}`;
+      const approveUrl = `${PUBLIC_BASE}/approve/${token}`;
+      const rejectUrl  = `${PUBLIC_BASE}/reject/${token}`;
       const subject = `New booking request: ${date} ${startTimes.join(', ')} — ${name}`;
       const html = `
         <h2>New Studio Booking (pending)</h2>
@@ -145,6 +160,7 @@ app.post('/book', async (req,res)=>{
   }
 });
 
+// Approve/Reject
 app.get('/approve/:token', async (req,res)=>{
   const { token } = req.params;
   const r = await db.run(`UPDATE bookings SET status='approved' WHERE approval_token=?`, token);
